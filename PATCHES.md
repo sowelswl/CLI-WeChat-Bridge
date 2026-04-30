@@ -23,6 +23,7 @@
 | **sendMessage 遇 ret=-2 自动重试一次** | `src/wechat/wechat-transport.ts` | iLink 偶发性 ret=-2 软拒绝；sleep 1.5s 后重试，避免单句卡掉破坏后续节奏 |
 | **关键消息走 critical-retry**（approval/fatal/task_failed/inbound_error） | `src/bridge/wechat-bridge.ts` (`queueWechatMessage`) | 审批弹框被 iLink 限流吞掉会让 agent 卡 10 分钟；critical context 内嵌 5 次指数退避（2/4/8/16/32 秒）直到送达 |
 | **bridge 端预审批安全 Bash**（`mkdir/cat/git/cp/mv/echo` 等复合命令） | `src/bridge/claude-hooks.ts` + `bridge-adapters.claude.ts` | claude 内置匹配器对 `mkdir && cat <<EOF` 这类复合命令不认 `Bash(*)`；bridge 在转发审批前用白名单 + 危险词黑名单（sudo/rm -rf/dd/curl\|sh 等）+ heredoc 剥离做预批，纯 WeChat 用户看不到 TUI 也不会被这种事卡死 |
+| **inject 目录 + cron-friendly 定时任务**（`<cwd>/.inject/`） | `src/bridge/inject-watcher.ts`（新增）+ `wechat-bridge.ts` | Claude Code 自带的 `CronCreate` 只在 REPL idle 时才触发，agent 一忙就漏。Bridge 现在监听每个 agent 的工作目录下 `.inject/`，任何写入的文件都会被当作伪装成 WeChat 消息送进 `handleInboundMessage` —— 自动享受 busy-defer / typing 指示器 / 输出回显。配套 `scripts/wechat-inject.sh` 给 cron 用 |
 
 外加：node-pty 需从源码重新编译以解决 Node 25 不兼容的 `posix_spawnp failed` 报错。
 

@@ -11,6 +11,7 @@ import { forwardWechatFinalReply } from "./bridge-final-reply.ts";
 import { migrateLegacyChannelFiles } from "../wechat/channel-config.ts";
 import { BridgeStateStore } from "./bridge-state.ts";
 import { reapOrphanedOpencodeProcesses, reapPeerBridgeProcesses } from "./bridge-process-reaper.ts";
+import { InjectDirWatcher } from "./inject-watcher.ts";
 import { clearLocalCompanionEndpoint } from "../companion/local-companion-link.ts";
 import type {
   ApprovalRequest,
@@ -640,7 +641,64 @@ async function main(): Promise<void> {
       : null;
   parentWatchTimer?.unref();
 
+  // Inject-dir watcher: an external scheduler (cron, launchd, etc.) drops
+  // a file in <cwd>/.inject and the bridge picks it up exactly the same way
+  // a real WeChat message would be — going through handleInboundMessage so
+  // the busy/defer/typing/wechat-mirror plumbing all applies. Solves the
+  // "Claude built-in cron only fires when REPL is idle" problem.
+  const injectWatcher = new InjectDirWatcher({
+    source: "scheduled",
+    onInject: async ({ text, source, filename }) => {
+      if (!ensureRuntimeOwnership()) return;
+      const message: InboundWechatMessage = {
+        senderId: stateStore.getState().authorizedUserId,
+        sender: source,
+        sessionId: `${source}-${filename}`,
+        text,
+        createdAt: nowIso(),
+        createdAtMs: Date.now(),
+      };
+      stateStore.touchActivity(message.createdAt);
+      stateStore.appendLog(
+        `inject_received: source=${source} file=${filename} text=${truncatePreview(text)}`,
+      );
+      let nextTask: ActiveTask | null = null;
+      try {
+        nextTask = await handleInboundMessage({
+          message,
+          options,
+          stateStore,
+          adapter,
+          transport,
+          queueWechatMessage,
+          outputBatcher,
+          // Defer-when-busy behaviour for inject: queue silently. The agent
+          // will pick it up when the current turn finishes; no need to spam
+          // the user with a "queued at position N" notice for a cron job.
+          deferInboundMessage: async (m) => {
+            deferredInboundMessages.push({ message: m });
+            stateStore.appendLog(
+              `deferred_inject: position=${deferredInboundMessages.length} file=${filename} text=${truncatePreview(m.text)}`,
+            );
+          },
+        });
+      } catch (err) {
+        const errorText = err instanceof Error ? err.message : String(err);
+        logError(`inject_error (${filename}): ${errorText}`);
+        stateStore.appendLog(`inject_error: file=${filename} ${errorText}`);
+      }
+      if (nextTask) {
+        activeTask = nextTask;
+        lastHeartbeatAt = 0;
+      }
+    },
+    onError: (err) => {
+      stateStore.appendLog(`inject_watcher_error: ${err.message}`);
+    },
+  });
+
   const cleanup = async () => {
+    injectWatcher.stop();
     if (parentWatchTimer) {
       clearInterval(parentWatchTimer);
     }
@@ -751,8 +809,12 @@ async function main(): Promise<void> {
       `Bridge started with adapter=${options.adapter} command=${options.command} cwd=${options.cwd}`,
     );
 
+    const injectDir = path.join(options.cwd, ".inject");
+    injectWatcher.start(injectDir);
+
     log(`WeChat bridge is ready for adapter "${options.adapter}".`);
     log(`Working directory: ${options.cwd}`);
+    log(`Scheduled-inject directory: ${injectDir}`);
     if (options.profile) {
       log(`Profile: ${options.profile}`);
     }

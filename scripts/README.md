@@ -8,6 +8,7 @@
 
 - `wechat-bridges-up.sh` —— 把一个或多个 channel 拉起来跑在 detached tmux session 里，崩了 5s 自动重启
 - `wechat-bridges-down.sh` —— 停掉指定 session
+- `wechat-inject.sh` —— 给运行中的 bridge 注入一条"伪装成微信消息"的提示，常配合 cron 用作定时任务（详见下方"定时任务"段）
 
 ## 前置
 
@@ -82,7 +83,40 @@ fi
 
 再到 **系统设置 → 通用 → 登录项** 把 `Terminal.app` 加进去（可以选择隐藏，但新版 macOS 不一定生效，可能开机会冒一个 Terminal 窗口出来，关掉就行）。
 
-### 为啥不直接走 launchd？
+## 定时任务（cron + inject）
+
+Claude Code 自带的 `CronCreate` 只在 REPL 空闲时触发，agent 在跑时事件就会被错过。Bridge 这层提供了一个更可靠的替代：**在 agent 的工作目录下放一个 `.inject/` 文件夹，bridge 监听这个目录，任何写入的文件会被当作"伪装成微信消息"送进去**。这条路享受 bridge 全套的 busy-defer / typing / 输出回显逻辑——agent 在跑也不会丢消息，会排队到下一个 idle 周期。
+
+最简用法：
+
+```bash
+# 用 wechat-inject.sh 包好（推荐，自动原子重命名）
+./scripts/wechat-inject.sh ~/wechat-channels/A "提醒我拍照吃药"
+
+# 或手动写文件（注意必须用 .tmp 中转，否则 bridge 可能读到半写状态）
+F=~/wechat-channels/A/.inject/$(date +%s)
+echo "提醒我拍照吃药" > $F.tmp && mv $F.tmp $F
+```
+
+cron 的典型用法：
+
+```cron
+# crontab -e
+# 早 9 点提醒拍照吃药
+0 9 * * * /path/to/repo/scripts/wechat-inject.sh /Users/me/wechat-channels/A "提醒我拍照吃药"
+
+# 工作日盘前 8:55 跑一次 /aniu
+55 8 * * 1-5 /path/to/repo/scripts/wechat-inject.sh /Users/me/wechat-channels/A "跑 /aniu 盘前分析"
+```
+
+注意点：
+
+- inject 文件最大 64KB（防止 OOM）
+- 文件名不限，但 `.tmp` 后缀会被 bridge 跳过（用作原子重命名的中转）
+- bridge 处理完会立即 unlink；处理失败也会 unlink（避免死循环），但错误会写到 `bridge.log`
+- 同一个 inject 在 agent 视角看就是"用户主动发了一条微信消息"，agent 的回复也会走正常的 WeChat 输出通道——你的微信会收到 agent 的回复
+
+## 为啥不直接走 launchd？
 
 试过，会被 macOS TCC 卡住：launchd 启动的 node 进程默认无权限读 `~/Desktop/`，工作目录在 Desktop 下的话会一启动就 EPERM 崩。要走 launchd 有两条路：
 

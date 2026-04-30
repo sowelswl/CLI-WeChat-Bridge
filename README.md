@@ -13,6 +13,7 @@
 > - **bridge 端预审批**：复合 Bash 命令（`mkdir && cat <<EOF` 等）走白名单 + 危险词黑名单自动放行，纯微信端用户不会被 TUI 弹框卡死
 > - **transcript-watcher**：流式向微信转发 assistant 文本，按句切段，不再"一坨发完"
 > - **inbound 图片解密**、`<task-notification>` 等系统注入消息不再泄露到微信
+> - **`<cwd>/.inject/` 定时任务**：cron 写文件即触发，bridge 当成"伪装成 WeChat 消息"送进 agent，busy-defer 自动生效（详见 [`scripts/README.md`](./scripts/README.md)）
 >
 > 完整列表与遗留待办见 [`PATCHES.md`](./PATCHES.md)。
 
