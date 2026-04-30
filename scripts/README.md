@@ -85,6 +85,20 @@ fi
 
 ## 定时任务（cron + inject）
 
+> **macOS TCC 坑提醒（重要）**：macOS 的 cron 由 launchd 拉起，没权限**执行**位于 `~/Desktop/` 下的脚本——cron 邮箱里会看到 `Operation not permitted`，cron 任务跑了等于没跑。但 cron **能 *写入* `~/Desktop/`**，所以脚本只要不在 Desktop 里就能正常工作。
+>
+> **简单解法**：把 `wechat-inject.sh` 复制（不是 symlink，symlink 解析后还是 EPERM）到 `~/.local/bin/`，crontab 里用复制后的路径调用：
+>
+> ```bash
+> mkdir -p ~/.local/bin
+> cp <repo>/scripts/wechat-inject.sh ~/.local/bin/
+> chmod +x ~/.local/bin/wechat-inject.sh
+> # crontab 里写 /Users/<you>/.local/bin/wechat-inject.sh ... 而不是 <repo>/scripts/...
+> ```
+>
+> 同样原因，**不要用"跑完 crontab 自删自己"的复合命令**（`... && crontab -l | grep -v X | crontab -`）——cron 启的 shell 跑 `crontab` 写临时文件也受 TCC 限制。老实写循环 cron 表达式即可（`0 9 * * *`）。
+
+
 Claude Code 自带的 `CronCreate` 只在 REPL 空闲时触发，agent 在跑时事件就会被错过。Bridge 这层提供了一个更可靠的替代：**在 agent 的工作目录下放一个 `.inject/` 文件夹，bridge 监听这个目录，任何写入的文件会被当作"伪装成微信消息"送进去**。这条路享受 bridge 全套的 busy-defer / typing / 输出回显逻辑——agent 在跑也不会丢消息，会排队到下一个 idle 周期。
 
 最简用法：
