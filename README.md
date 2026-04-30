@@ -1,8 +1,20 @@
-# CLI WeChat Bridge 
+# CLI WeChat Bridge
 
 **命令行工具的微信桥接**：本项目用于桥接微信消息与本地运行的 [`Codex`](https://github.com/openai/codex)、[`Claude Code`](https://code.claude.com/docs/en/overview) 或持久化 `powershell.exe` 会话，并将本地输出、审批请求与运行状态同步回微信。
 
 当前实现以本地工作流为中心展开，重点是保留本地原生终端体验，并在此基础上提供微信侧的远程输入、结果回流与状态同步能力。
+
+> **关于本 fork**
+>
+> 本仓库 fork 自 [UNLINEARITY/CLI-WeChat-Bridge](https://github.com/UNLINEARITY/CLI-WeChat-Bridge)（MIT License），在上游基础上做了一组围绕 macOS 多账号部署、iLink 限流应对、纯微信端 UX 的修补：
+>
+> - **多账号同机部署**：多个 `CLAUDE_WECHAT_CHANNEL_DATA_DIR` 启动的 bridge 不再互相 reap
+> - **iLink 限流应对**：800ms 自我节流 + `ret=-2` 自动重试 + critical 消息 5 次指数退避
+> - **bridge 端预审批**：复合 Bash 命令（`mkdir && cat <<EOF` 等）走白名单 + 危险词黑名单自动放行，纯微信端用户不会被 TUI 弹框卡死
+> - **transcript-watcher**：流式向微信转发 assistant 文本，按句切段，不再"一坨发完"
+> - **inbound 图片解密**、`<task-notification>` 等系统注入消息不再泄露到微信
+>
+> 完整列表与遗留待办见 [`PATCHES.md`](./PATCHES.md)。
 
 ## 这个项目解决什么问题
 
@@ -34,10 +46,20 @@
 ### 1. 克隆仓库并安装依赖
 
 ```bash
-git clone https://github.com/UNLINEARITY/CLI-WeChat-Bridge
+# 本 fork（带上文列出的 patch）：
+git clone https://github.com/kbykb/CLI-WeChat-Bridge
+
+# 或直接拉上游原版：
+# git clone https://github.com/UNLINEARITY/CLI-WeChat-Bridge
+
 cd CLI-WeChat-Bridge
 bun install
 ```
+
+> macOS + Node 25 用户注意：`node-pty` 的 prebuild 不兼容 Node 25，安装完 deps 之后需要从源码重编：
+> ```bash
+> npm rebuild node-pty --build-from-source
+> ```
 
 ### 2. 安装全局命令
 
@@ -164,6 +186,27 @@ wechat-claude-start
 
 ![Claude Linux](docs/images/image-7.png)
 
+### 6.（可选）多微信号同机部署
+
+如果你想在一台机器上同时跑两个（或更多）微信账号 —— 比如自己一个、另一半一个、室友一个，每个账号绑自己的 bridge、自己的工作目录、自己的对话记忆，互不干扰：
+
+```bash
+# 第一次：分别给两个账号扫码登录
+CLAUDE_WECHAT_CHANNEL_DATA_DIR=~/.claude/channels/wechat-A bun run setup
+# （另外一个账号扫码）
+CLAUDE_WECHAT_CHANNEL_DATA_DIR=~/.claude/channels/wechat-B bun run setup
+
+# 平时启动：两个 wechat-claude-start 并存
+cd ~/path/to/workspace-A
+CLAUDE_WECHAT_CHANNEL_DATA_DIR=~/.claude/channels/wechat-A wechat-claude-start
+
+cd ~/path/to/workspace-B
+CLAUDE_WECHAT_CHANNEL_DATA_DIR=~/.claude/channels/wechat-B wechat-claude-start
+```
+
+每个 channel 有独立的 `account.json`、`bridge.lock.json`、对话 jsonl 和记忆。同机的多个 bridge 互不 reap（peer-bridge 清理逻辑按 `--cwd` 范围隔离）。
+
+如果嫌每次开终端麻烦，可以把 `wechat-claude-start` 包到 `tmux new-session -d` 里跑，再加一行 `~/.zshrc` 钩子做"开 Terminal 即自动唤起"。注意 macOS launchd 启动的进程默认无法读 `~/Desktop/`（TCC 限制），所以走 launchd 路线要么把项目挪出 `~/Desktop/`，要么给 `node` 二进制加完整磁盘访问权限。
 
 ## 适配器支持情况
 
