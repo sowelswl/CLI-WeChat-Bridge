@@ -109,6 +109,11 @@ export type BridgeEvent =
       type: "final_reply";
       text: string;
       timestamp: string;
+      // When true, the adapter has already streamed the narration text via
+      // earlier `stdout` events; the final_reply payload should only be used
+      // to extract attachments (image/file/voice/video markers), not to
+      // re-send the visible text.
+      attachmentsOnly?: boolean;
     }
   | {
       type: "status";

@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import path from "node:path";
+
 import type { ApprovalRequest } from "./bridge-types.ts";
 import { normalizeOutput, truncatePreview } from "./bridge-utils.ts";
 
@@ -97,7 +100,10 @@ export function extractClaudeResumeConversationId(
   return conversationId || null;
 }
 
-export function buildClaudeHookSettings(command: string): Record<string, unknown> {
+export function buildClaudeHookSettings(
+  command: string,
+  cwd?: string,
+): Record<string, unknown> {
   const hook = {
     hooks: [
       {
@@ -107,7 +113,27 @@ export function buildClaudeHookSettings(command: string): Record<string, unknown
     ],
   };
 
+  // Merge user's per-project settings (.claude/settings.json) so that
+  // model / env / permissions / other fields aren't lost when we pass
+  // --settings <runtime>. Hooks are owned by the bridge, so they win.
+  let userSettings: Record<string, unknown> = {};
+  if (cwd) {
+    try {
+      const projectSettingsPath = path.join(cwd, ".claude", "settings.json");
+      if (fs.existsSync(projectSettingsPath)) {
+        const raw = fs.readFileSync(projectSettingsPath, "utf8");
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          userSettings = parsed as Record<string, unknown>;
+        }
+      }
+    } catch {
+      // best-effort — if user's settings file is malformed, we just skip the merge.
+    }
+  }
+
   return {
+    ...userSettings,
     hooks: {
       SessionStart: [hook],
       UserPromptSubmit: [hook],
@@ -242,6 +268,102 @@ export function buildClaudePermissionApprovalRequest(
     detailLabel,
     detailPreview,
   };
+}
+
+/**
+ * Decide whether a PermissionRequest is safe to auto-approve at the bridge
+ * level — the WeChat-only user can't see the local Claude TUI and getting
+ * stranded on a prompt for a routine `mkdir && cat <<EOF` is a UX dead-end
+ * (compounded by iLink rate-limiting the approval-prompt message itself).
+ *
+ * Conservative policy: Bash only, every piece of a compound command must
+ * start with a whitelisted command, and the full text must not match any of
+ * the always-deny patterns (sudo, destructive rm, dd, /dev/ writes, curl|sh).
+ * Heredoc bodies are stripped before splitting so log contents inside
+ * `cat <<EOF ... EOF` can't fool the parser with `&&` or `;` inside data.
+ */
+export function shouldAutoApprovePermissionRequest(payload: ClaudeHookPayload): boolean {
+  const toolName = typeof payload.tool_name === "string" ? payload.tool_name.trim() : "";
+  if (toolName !== "Bash") return false;
+
+  const command = typeof payload.tool_input?.command === "string"
+    ? (payload.tool_input.command as string).trim()
+    : "";
+  if (!command) return false;
+
+  const DENY_PATTERNS: RegExp[] = [
+    /\bsudo\b/,
+    /\brm\s+-[rRf]+\s+(\/[^\/\s]|~|\$HOME|\.\s*$)/,
+    /\brm\s+-[rRf]+\s+\*/,
+    /\bdd\s+if=/,
+    /\bmkfs\b/,
+    /\bshutdown\b/,
+    /\breboot\b/,
+    />\s*\/dev\//,
+    /\b(curl|wget)\b[^|]*\|\s*(sh|bash|zsh)\b/,
+    /\bchmod\s+(0?7|7)77\b/,
+    /\bgit\s+push\s+.*--force\b/,
+    /\bgit\s+reset\s+--hard\b/,
+  ];
+  for (const pat of DENY_PATTERNS) {
+    if (pat.test(command)) return false;
+  }
+
+  // Strip heredoc bodies so connectors inside data don't get split.
+  const stripped = command.replace(
+    /<<-?\s*'?"?(\w+)'?"?[\s\S]*?\n\s*\1\s*$/gm,
+    "<<HEREDOC",
+  );
+
+  const SAFE_FIRST_TOKENS = new Set([
+    // Filesystem reads
+    "ls", "cat", "head", "tail", "wc", "stat", "file", "du", "df", "tree",
+    "find", "fd", "fdfind", "grep", "rg", "egrep", "fgrep",
+    "awk", "sed", "sort", "uniq", "cut", "paste", "tr", "column",
+    "diff", "cmp", "md5sum", "sha256sum",
+    // Filesystem writes (safe-ish under deny rules above)
+    "mkdir", "touch", "cp", "mv", "ln", "tee",
+    "tar", "unzip", "zip", "gzip", "gunzip", "zcat",
+    // Echoes / utilities
+    "echo", "printf", "date", "seq", "true", "false", "exit", "test", "[",
+    "env", "printenv", "which", "type", "whoami", "hostname", "uname", "uptime",
+    "pwd", "cd", "pushd", "popd",
+    // Process / network read
+    "ps", "pgrep", "lsof", "netstat",
+    // Data parsers
+    "jq", "yq", "xxd", "hexdump", "base64",
+    // Git read-only / safe writes
+    "git", "gh",
+    // Package read
+    "brew", "npm", "yarn", "pnpm", "bun", "pip", "uv", "cargo",
+    // Mac niceties
+    "open", "say", "pbcopy", "pbpaste",
+    // Network read
+    "curl", "wget", "aria2c",
+  ]);
+
+  const SHELL_BUILTINS_TO_SKIP = new Set([
+    "if", "then", "else", "elif", "fi", "for", "do", "done", "while", "case",
+    "esac", "function", "return", "local", "export", "set", "unset",
+  ]);
+
+  const pieces = stripped.split(/\s*(?:&&|\|\||;|\|)\s*/);
+  for (const piece of pieces) {
+    const trimmed = piece.trim();
+    if (!trimmed) continue;
+    // Skip leading env-var assignments (FOO=bar BAR=baz cmd ...).
+    let rest = trimmed;
+    while (/^[A-Z_][A-Z0-9_]*=/.test(rest)) {
+      rest = rest.replace(/^\S+\s*/, "");
+    }
+    if (!rest) continue;
+    const firstToken = rest.split(/\s+/)[0] ?? "";
+    if (!firstToken) return false;
+    if (SHELL_BUILTINS_TO_SKIP.has(firstToken)) continue;
+    if (!SAFE_FIRST_TOKENS.has(firstToken)) return false;
+  }
+
+  return true;
 }
 
 export function buildClaudePermissionDecisionHookOutput(

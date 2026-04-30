@@ -104,6 +104,9 @@ async function askYesNo(prompt: string): Promise<boolean> {
 }
 
 async function printQRCode(qrContent: string): Promise<void> {
+  // Always show the URL — terminals with non-monospace block-char rendering
+  // (Claude Code, some IDEs) can't display the ASCII QR readably.
+  console.log(`\n📱 Or open this URL in a browser to see the QR clearly:\n   ${qrContent}\n`);
   try {
     const qrterm = await import("qrcode-terminal");
     await new Promise<void>((resolve) => {

@@ -58,6 +58,18 @@ const WECHAT_ATTACHMENT_PROMPT_PREFIX = [
 const WECHAT_ATTACHMENT_BLOCK_RE =
   /\n```wechat-attachments[ \t]*\n([\s\S]*?)\n```[ \t]*$/;
 
+// Strip ANY ```wechat-attachments ... ``` block (not just the trailing one)
+// from streamed narration text. The agent occasionally embeds an attachment
+// block in the middle of a longer reply; without a global match, the markup
+// would leak into WeChat as raw markdown.
+//
+// NOTE: UNLINEARITY's parseWechatFinalReply only honors a TRAILING attachment
+// block as a real attachment. Mid-text attachment blocks aren't currently
+// rendered as images either way — but stripping at least removes the visible
+// markup so the user sees clean text.
+export const WECHAT_ATTACHMENT_BLOCK_STRIP_RE =
+  /\n?```wechat-attachments[ \t]*\n[\s\S]*?\n```[ \t]*/g;
+
 const WECHAT_ATTACHMENT_KINDS = ["image", "file", "video", "voice"] as const;
 const INLINE_IMAGE_EXTENSIONS = new Set([
   ".png",
@@ -309,51 +321,57 @@ export function buildWechatInboundPrompt(text: string): string {
 
 export function parseWechatFinalReply(text: string): ParsedWechatFinalReply {
   const normalized = normalizeOutput(text);
-  const withLeadingNewline = normalized.startsWith("\n")
-    ? normalized
-    : `\n${normalized}`;
-  const match = withLeadingNewline.match(WECHAT_ATTACHMENT_BLOCK_RE);
-  if (!match) {
-    return extractInlineWechatAttachments(normalized);
-  }
 
+  // Match every ```wechat-attachments ... ``` block, regardless of whether
+  // the agent placed it at the very end or sandwiched it in the middle of
+  // its narration.
+  const blockRe = /\n?```wechat-attachments[ \t]*\n([\s\S]*?)\n```[ \t]*/g;
   const attachments: WechatReplyAttachment[] = [];
-  const lines = match[1]
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
+  let invalidBlockSeen = false;
+  let m: RegExpExecArray | null;
 
-  if (!lines.length) {
+  while ((m = blockRe.exec(normalized)) !== null) {
+    const lines = m[1]
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    if (!lines.length) {
+      invalidBlockSeen = true;
+      continue;
+    }
+
+    let allParsed = true;
+    for (const line of lines) {
+      const parsed = /^(image|file|video|voice)\s+(.+)$/.exec(line);
+      if (!parsed) {
+        invalidBlockSeen = true;
+        allParsed = false;
+        break;
+      }
+      const kind = parsed[1] as WechatAttachmentKind;
+      const attachmentPath = resolveWechatAttachmentPath(parsed[2]);
+      if (!attachmentPath) {
+        invalidBlockSeen = true;
+        allParsed = false;
+        break;
+      }
+      attachments.push({ kind, path: attachmentPath });
+    }
+    if (!allParsed) continue;
+  }
+
+  if (attachments.length === 0) {
+    if (invalidBlockSeen) {
+      return extractInlineWechatAttachments(normalized);
+    }
     return extractInlineWechatAttachments(normalized);
   }
 
-  for (const line of lines) {
-    const parsed = /^(image|file|video|voice)\s+(.+)$/.exec(line);
-    if (!parsed) {
-      return extractInlineWechatAttachments(normalized);
-    }
-
-    const kind = parsed[1] as WechatAttachmentKind;
-    const attachmentPath = resolveWechatAttachmentPath(parsed[2]);
-    if (!attachmentPath) {
-      return extractInlineWechatAttachments(normalized);
-    }
-
-    attachments.push({
-      kind,
-      path: attachmentPath,
-    });
-  }
-
-  const blockIndex = withLeadingNewline.length - match[0].length;
-  const visibleText = withLeadingNewline.slice(0, blockIndex).trim();
-  const parsedFromBlock = {
-    visibleText,
-    attachments,
-  };
-  return parsedFromBlock.attachments.length > 0
-    ? parsedFromBlock
-    : extractInlineWechatAttachments(normalized);
+  // Strip every attachment block from visible text so the user only sees
+  // narration + the actual attachments, not the protocol markup.
+  const visibleText = normalized.replace(blockRe, "").trim();
+  return { visibleText, attachments };
 }
 
 export function parseCodexSessionAgentMessage(
@@ -1183,8 +1201,8 @@ export class OutputBatcher {
 
   constructor(
     onFlush: (text: string) => Promise<void> | void,
-    flushIntervalMs = 1_000,
-    maxChars = 1_200,
+    flushIntervalMs = 800,
+    maxChars = 200,
   ) {
     this.onFlush = onFlush;
     this.flushIntervalMs = flushIntervalMs;
@@ -1200,6 +1218,20 @@ export class OutputBatcher {
     this.buffer += normalized;
     this.recentText = (this.recentText + normalized).slice(-6_000);
 
+    // Real-person feel: flush at sentence boundaries (。！？.!?\n\n)
+    // as soon as we have a meaningful chunk. Avoids "one big paragraph"
+    // delivery and emulates typing-then-sending in pieces.
+    const MIN_SENTENCE_FLUSH = 4;
+    while (true) {
+      const breakIdx = this.findSentenceBreak(this.buffer, MIN_SENTENCE_FLUSH);
+      if (breakIdx === -1) break;
+      const nextChunk = this.buffer.slice(0, breakIdx + 1);
+      this.buffer = this.buffer.slice(breakIdx + 1);
+      this.enqueueFlush(nextChunk);
+    }
+
+    // Hard ceiling fallback: if some block ran on without punctuation,
+    // still split by maxChars so a single chunk doesn't grow unbounded.
     while (this.buffer.length >= this.maxChars) {
       const nextChunk = this.buffer.slice(0, this.maxChars);
       this.buffer = this.buffer.slice(this.maxChars);
@@ -1207,6 +1239,21 @@ export class OutputBatcher {
     }
 
     this.ensureFlushTimer();
+  }
+
+  private findSentenceBreak(text: string, minLength: number): number {
+    // Need at least minLength chars before we'll consider flushing,
+    // so very short fragments ("好。") wait for more context.
+    if (text.length < minLength) return -1;
+    // Chinese punctuation: 。！？； — always a sentence end.
+    // English . ! ? — only count when NOT inside URLs/numbers/abbreviations:
+    //   - "." must follow a non-digit AND be followed by whitespace/EOL
+    //     (so github.com is preserved, "1. " is preserved, "hi. " breaks).
+    //   - "!" / "?" must follow a non-digit and be followed by whitespace/EOL.
+    // Double newline is also a hard break.
+    const re = /[。！？；]|(?<!\d)[.!?](?=\s|$)|\n\n/g;
+    const m = re.exec(text);
+    return m ? m.index + m[0].length - 1 : -1;
   }
 
   async flushNow(): Promise<void> {

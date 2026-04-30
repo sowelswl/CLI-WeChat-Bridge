@@ -1,4 +1,43 @@
 import { spawnSync } from "node:child_process";
+import path from "node:path";
+
+/**
+ * Pull the `--cwd <value>` (or `--cwd=<value>`) argument out of a bridge
+ * command line. Returns null if not present. Used to scope peer-bridge reaping
+ * to the same workspace — without this, two bridges started for different
+ * `CLAUDE_WECHAT_CHANNEL_DATA_DIR` channels (e.g. user A vs user B) would kill
+ * each other on startup.
+ */
+export function extractCwdFromBridgeCommandLine(commandLine: string): string | null {
+  // Match `--cwd <value>` (space-separated) — value runs until the next
+  // whitespace-prefixed `--flag` or end of string. Quoted values are handled
+  // by the alternative branch below.
+  const eqMatch = /(?:^|\s)--cwd=("[^"]*"|'[^']*'|\S+)/.exec(commandLine);
+  if (eqMatch?.[1]) {
+    return stripQuotes(eqMatch[1]);
+  }
+  const spaceMatch = /(?:^|\s)--cwd\s+("[^"]*"|'[^']*'|\S+)/.exec(commandLine);
+  if (spaceMatch?.[1]) {
+    return stripQuotes(spaceMatch[1]);
+  }
+  return null;
+}
+
+function stripQuotes(value: string): string {
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
+function isSameCwd(left: string, right: string): boolean {
+  const a = path.resolve(left);
+  const b = path.resolve(right);
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
 
 export type BridgeProcessRecord = {
   pid: number;
@@ -112,6 +151,7 @@ function normalizeBridgeProcessRecord(value: unknown): BridgeProcessRecord | nul
 export function parseWindowsBridgeProcessProbeOutput(
   stdout: string,
   currentPid = process.pid,
+  currentCwd?: string,
 ): BridgeProcessRecord[] {
   const trimmed = stdout.trim();
   if (!trimmed) {
@@ -131,12 +171,14 @@ export function parseWindowsBridgeProcessProbeOutput(
     .filter((record): record is BridgeProcessRecord => Boolean(record))
     .filter(
       (record) => record.pid !== currentPid && isWechatBridgeCommandLine(record.commandLine),
-    );
+    )
+    .filter((record) => matchesCurrentCwd(record.commandLine, currentCwd));
 }
 
 export function parsePosixBridgeProcessProbeOutput(
   stdout: string,
   currentPid = process.pid,
+  currentCwd?: string,
 ): BridgeProcessRecord[] {
   return stdout
     .split(/\r?\n/)
@@ -160,10 +202,29 @@ export function parsePosixBridgeProcessProbeOutput(
     .filter((record): record is BridgeProcessRecord => Boolean(record))
     .filter(
       (record) => record.pid !== currentPid && isWechatBridgeCommandLine(record.commandLine),
-    );
+    )
+    .filter((record) => matchesCurrentCwd(record.commandLine, currentCwd));
 }
 
-function listWindowsBridgeProcesses(currentPid = process.pid): BridgeProcessRecord[] {
+function matchesCurrentCwd(commandLine: string, currentCwd: string | undefined): boolean {
+  // If we don't know our own cwd (legacy callers), behave as before — match
+  // any peer bridge. If we do know it, only keep peers running under the
+  // same cwd, so multi-channel deployments (different
+  // CLAUDE_WECHAT_CHANNEL_DATA_DIR per user) don't reap each other.
+  if (!currentCwd) return true;
+  const peerCwd = extractCwdFromBridgeCommandLine(commandLine);
+  if (!peerCwd) {
+    // Peer didn't expose a --cwd flag: be conservative, don't reap an
+    // unidentifiable bridge belonging to who-knows-which channel.
+    return false;
+  }
+  return isSameCwd(peerCwd, currentCwd);
+}
+
+function listWindowsBridgeProcesses(
+  currentPid = process.pid,
+  currentCwd?: string,
+): BridgeProcessRecord[] {
   const probe = spawnSync(
     "powershell.exe",
     [
@@ -192,10 +253,13 @@ function listWindowsBridgeProcesses(currentPid = process.pid): BridgeProcessReco
     return [];
   }
 
-  return parseWindowsBridgeProcessProbeOutput(probe.stdout, currentPid);
+  return parseWindowsBridgeProcessProbeOutput(probe.stdout, currentPid, currentCwd);
 }
 
-function listPosixBridgeProcesses(currentPid = process.pid): BridgeProcessRecord[] {
+function listPosixBridgeProcesses(
+  currentPid = process.pid,
+  currentCwd?: string,
+): BridgeProcessRecord[] {
   const probe = spawnSync(
     "ps",
     ["-ax", "-o", "pid=", "-o", "command="],
@@ -209,13 +273,16 @@ function listPosixBridgeProcesses(currentPid = process.pid): BridgeProcessRecord
     return [];
   }
 
-  return parsePosixBridgeProcessProbeOutput(probe.stdout, currentPid);
+  return parsePosixBridgeProcessProbeOutput(probe.stdout, currentPid, currentCwd);
 }
 
-export function listPeerBridgeProcesses(currentPid = process.pid): BridgeProcessRecord[] {
+export function listPeerBridgeProcesses(
+  currentPid = process.pid,
+  currentCwd?: string,
+): BridgeProcessRecord[] {
   return process.platform === "win32"
-    ? listWindowsBridgeProcesses(currentPid)
-    : listPosixBridgeProcesses(currentPid);
+    ? listWindowsBridgeProcesses(currentPid, currentCwd)
+    : listPosixBridgeProcesses(currentPid, currentCwd);
 }
 
 /**
@@ -354,10 +421,11 @@ export function killProcessTreeSync(pid: number): void {
 
 export async function reapPeerBridgeProcesses(params: {
   currentPid?: number;
+  currentCwd?: string;
   logger?: (message: string) => void;
 } = {}): Promise<number[]> {
   const currentPid = params.currentPid ?? process.pid;
-  const peers = listPeerBridgeProcesses(currentPid);
+  const peers = listPeerBridgeProcesses(currentPid, params.currentCwd);
   const terminated: number[] = [];
 
   for (const peer of peers) {

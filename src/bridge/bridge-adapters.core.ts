@@ -827,6 +827,21 @@ export abstract class AbstractPtyAdapter implements BridgeAdapter {
       return;
     }
 
+    // Treat exit-code-0 as a normal shutdown, not a fatal error.
+    // Claude Code (and similar TUIs) can exit cleanly after a Stop hook /
+    // session end without that being unexpected. Reporting it as "fatal"
+    // tears down the bridge and drops in-flight stream output that hasn't
+    // been delivered to WeChat yet.
+    if (exitCode === 0) {
+      this.emit({
+        type: "status",
+        status: "stopped",
+        message: `${this.options.kind} worker exited cleanly (code 0).`,
+        timestamp: nowIso(),
+      });
+      return;
+    }
+
     const exitLabel =
       typeof exitCode === "number" ? `code ${exitCode}` : "an unknown code";
     this.emit({

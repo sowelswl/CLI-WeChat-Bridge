@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
-import { createCipheriv } from "node:crypto";
+import { createCipheriv, createDecipheriv } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import {
@@ -39,6 +40,10 @@ const UPLOAD_MEDIA_TYPE_VIDEO = 2;
 const UPLOAD_MEDIA_TYPE_FILE = 3;
 const UPLOAD_MEDIA_TYPE_VOICE = 4;
 
+const TYPING_STATUS_START = 1;
+const TYPING_STATUS_STOP = 2;
+const TYPING_REQUEST_TIMEOUT_MS = 5_000;
+
 export type AccountData = {
   token: string;
   baseUrl: string;
@@ -58,10 +63,24 @@ interface RefMessage {
   title?: string;
 }
 
+interface InboundMediaInfo {
+  encrypt_query_param?: string;
+  aes_key?: string;
+  encrypt_type?: number;
+}
+
+interface InboundImageItem {
+  media?: InboundMediaInfo;
+  mid_size?: number;
+  width?: number;
+  height?: number;
+}
+
 interface MessageItem {
   type?: number;
   text_item?: TextItem;
   voice_item?: { text?: string };
+  image_item?: InboundImageItem;
   ref_msg?: RefMessage;
 }
 
@@ -90,6 +109,7 @@ export type InboundWechatMessage = {
   sender: string;
   sessionId: string;
   text: string;
+  mediaPaths?: string[];
   contextToken?: string;
   createdAt: string;
   createdAtMs?: number;
@@ -459,6 +479,148 @@ function encryptAesEcb(plaintext: Buffer, key: Buffer): Buffer {
   return Buffer.concat([cipher.update(plaintext), cipher.final()]);
 }
 
+function decryptAesEcb(ciphertext: Buffer, key: Buffer): Buffer {
+  const decipher = createDecipheriv("aes-128-ecb", key, null);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+function decodeMessageAesKey(encoded: string): Buffer {
+  const decoded = Buffer.from(encoded, "base64");
+  if (decoded.length === 16) {
+    return decoded;
+  }
+  if (decoded.length === 32) {
+    const text = decoded.toString("ascii");
+    if (/^[0-9a-fA-F]+$/.test(text)) {
+      return Buffer.from(text, "hex");
+    }
+  }
+  throw new Error(`unexpected aes_key format (${decoded.length} decoded bytes)`);
+}
+
+function buildCdnDownloadUrl(cdnBaseUrl: string, encryptQueryParam: string): string {
+  return `${cdnBaseUrl}/download?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`;
+}
+
+const INBOUND_MEDIA_DIR = path.join(os.tmpdir(), "wechat-inbound-media");
+
+async function ensureInboundMediaDir(): Promise<void> {
+  await fs.promises.mkdir(INBOUND_MEDIA_DIR, { recursive: true });
+}
+
+async function downloadAndDecryptCdnMedia(
+  cdnBaseUrl: string,
+  encryptQueryParam: string,
+  aesKeyB64: string,
+): Promise<Buffer> {
+  const url = buildCdnDownloadUrl(cdnBaseUrl, encryptQueryParam);
+  const res = await fetch(url, {
+    method: "GET",
+    headers: { "User-Agent": "wechat-bridge/inbound-media" },
+  });
+  if (!res.ok) {
+    throw new Error(`CDN download failed: HTTP ${res.status} ${res.statusText}`);
+  }
+  const cipher = Buffer.from(await res.arrayBuffer());
+  return decryptAesEcb(cipher, decodeMessageAesKey(aesKeyB64));
+}
+
+function detectImageExtension(buf: Buffer): string {
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "jpg";
+  if (
+    buf.length >= 8 &&
+    buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47
+  ) return "png";
+  if (
+    buf.length >= 6 &&
+    buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46
+  ) return "gif";
+  if (
+    buf.length >= 12 &&
+    buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+    buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50
+  ) return "webp";
+  return "bin";
+}
+
+async function extractMediaFromMessage(
+  message: WeixinMessage,
+  cdnBaseUrl: string,
+  logger?: TransportLogger,
+): Promise<string[]> {
+  const items = message.item_list ?? [];
+  if (items.length === 0) return [];
+
+  const paths: string[] = [];
+
+  for (const item of items) {
+    if (item.type !== MSG_ITEM_IMAGE) continue;
+    const media = item.image_item?.media;
+    const queryParam = media?.encrypt_query_param;
+    const aesKey = media?.aes_key;
+    if (!queryParam || !aesKey) continue;
+
+    try {
+      const data = await downloadAndDecryptCdnMedia(cdnBaseUrl, queryParam, aesKey);
+      await ensureInboundMediaDir();
+      const hash = crypto.createHash("sha1").update(data).digest("hex").slice(0, 16);
+      const ext = detectImageExtension(data);
+      const filePath = path.join(INBOUND_MEDIA_DIR, `${hash}.${ext}`);
+      await fs.promises.writeFile(filePath, data);
+      paths.push(filePath);
+    } catch (err) {
+      logger?.logError(
+        `Failed to download/decrypt inbound image: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  return paths;
+}
+
+async function fetchTypingTicket(params: {
+  account: AccountData;
+  userId: string;
+  contextToken?: string;
+}): Promise<string | null> {
+  try {
+    const raw = await apiFetch({
+      baseUrl: params.account.baseUrl,
+      endpoint: "ilink/bot/getconfig",
+      body: JSON.stringify({
+        ilink_user_id: params.userId,
+        context_token: params.contextToken ?? "",
+      }),
+      token: params.account.token,
+      timeoutMs: TYPING_REQUEST_TIMEOUT_MS,
+    });
+    const parsed = JSON.parse(raw) as { typing_ticket?: string };
+    const ticket = parsed.typing_ticket?.trim();
+    return ticket && ticket.length > 0 ? ticket : null;
+  } catch {
+    return null;
+  }
+}
+
+async function sendTypingStatus(params: {
+  account: AccountData;
+  userId: string;
+  ticket: string;
+  status: typeof TYPING_STATUS_START | typeof TYPING_STATUS_STOP;
+}): Promise<void> {
+  await apiFetch({
+    baseUrl: params.account.baseUrl,
+    endpoint: "ilink/bot/sendtyping",
+    body: JSON.stringify({
+      ilink_user_id: params.userId,
+      typing_ticket: params.ticket,
+      status: params.status,
+    }),
+    token: params.account.token,
+    timeoutMs: TYPING_REQUEST_TIMEOUT_MS,
+  });
+}
+
 function aesEcbPaddedSize(plaintextSize: number): number {
   return Math.ceil((plaintextSize + 1) / 16) * 16;
 }
@@ -765,6 +927,8 @@ export class WeChatTransport {
   private readonly contextTokenCache = new Map<string, string>(
     Object.entries(readJsonFile<ContextTokenState>(CONTEXT_CACHE_FILE) ?? {}),
   );
+  private readonly typingTicketCache = new Map<string, string>();
+  private readonly typingHeartbeats = new Map<string, ReturnType<typeof setInterval>>();
   private syncBuffer = "";
 
   constructor(logger: TransportLogger) {
@@ -845,7 +1009,13 @@ export class WeChatTransport {
       }
 
       const text = extractTextFromMessage(rawMessage);
-      if (!text) {
+      const mediaPaths = await extractMediaFromMessage(
+        rawMessage,
+        CDN_BASE_URL,
+        this.logger,
+      );
+
+      if (!text && mediaPaths.length === 0) {
         continue;
       }
 
@@ -862,6 +1032,10 @@ export class WeChatTransport {
         this.cacheContextToken(senderId, rawMessage.context_token);
       }
 
+      // Fetch typing ticket in the background so future startTyping() calls work.
+      // Doesn't block message delivery.
+      void this.maybeRefreshTypingTicket(account, senderId, rawMessage.context_token);
+
       const createdAtMs = rawMessage.create_time_ms;
       if (
         typeof options.minCreatedAtMs === "number" &&
@@ -876,6 +1050,7 @@ export class WeChatTransport {
         sender: normalizeSender(senderId),
         sessionId: rawMessage.session_id ?? "",
         text,
+        mediaPaths: mediaPaths.length > 0 ? mediaPaths : undefined,
         contextToken: rawMessage.context_token,
         createdAt: formatTimestamp(rawMessage.create_time_ms),
         createdAtMs,
@@ -1103,24 +1278,58 @@ export class WeChatTransport {
     contextToken: string,
     itemList: unknown[],
   ): Promise<void> {
-    await apiFetch({
-      baseUrl: account.baseUrl,
-      endpoint: "ilink/bot/sendmessage",
-      body: JSON.stringify({
-        msg: {
-          from_user_id: "",
-          to_user_id: recipientId,
-          client_id: this.generateClientId(),
-          message_type: MSG_TYPE_BOT,
-          message_state: MSG_STATE_FINISH,
-          item_list: itemList,
-          context_token: contextToken,
-        },
-        base_info: { channel_version: CHANNEL_VERSION },
-      }),
-      token: account.token,
-      timeoutMs: SEND_TIMEOUT_MS,
-    });
+    // iLink returns HTTP 200 with non-zero errcode/ret on rate-limit and other
+    // soft failures. apiFetch only checks res.ok, so we have to inspect the
+    // body here. `ret=-2` is the undocumented "rejected, try again" signal we
+    // see when chunks arrive too fast — retry once with a backoff before
+    // surfacing the error.
+    const SEND_RETRY_BACKOFF_MS = 1_500;
+    const MAX_RETRIES = 1;
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
+      const raw = await apiFetch({
+        baseUrl: account.baseUrl,
+        endpoint: "ilink/bot/sendmessage",
+        body: JSON.stringify({
+          msg: {
+            from_user_id: "",
+            to_user_id: recipientId,
+            client_id: this.generateClientId(),
+            message_type: MSG_TYPE_BOT,
+            message_state: MSG_STATE_FINISH,
+            item_list: itemList,
+            context_token: contextToken,
+          },
+          base_info: { channel_version: CHANNEL_VERSION },
+        }),
+        token: account.token,
+        timeoutMs: SEND_TIMEOUT_MS,
+      });
+
+      let response: { ret?: number; errcode?: number; errmsg?: string } = {};
+      try {
+        response = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      if (
+        (response.ret === undefined || response.ret === 0) &&
+        (response.errcode === undefined || response.errcode === 0)
+      ) {
+        return;
+      }
+
+      lastError = new Error(
+        `sendmessage failed: ret=${response.ret} errcode=${response.errcode} errmsg=${response.errmsg ?? ""}`,
+      );
+
+      if (attempt < MAX_RETRIES) {
+        await new Promise((resolve) => setTimeout(resolve, SEND_RETRY_BACKOFF_MS));
+      }
+    }
+
+    throw lastError ?? new Error("sendmessage failed");
   }
 
   private async prepareUpload(
@@ -1281,6 +1490,83 @@ export class WeChatTransport {
     this.contextTokenCache.clear();
     if (fs.existsSync(CONTEXT_CACHE_FILE)) {
       fs.rmSync(CONTEXT_CACHE_FILE, { force: true });
+    }
+  }
+
+  private async maybeRefreshTypingTicket(
+    account: AccountData,
+    userId: string,
+    contextToken: string | undefined,
+  ): Promise<void> {
+    if (this.typingTicketCache.has(userId)) return;
+    const ticket = await fetchTypingTicket({ account, userId, contextToken });
+    if (ticket) {
+      this.typingTicketCache.set(userId, ticket);
+    }
+  }
+
+  async startTyping(userId: string): Promise<void> {
+    const account = this.requireAccount();
+    let ticket = this.typingTicketCache.get(userId);
+    if (!ticket) {
+      ticket = (await fetchTypingTicket({
+        account,
+        userId,
+        contextToken: this.contextTokenCache.get(userId),
+      })) ?? undefined;
+      if (ticket) this.typingTicketCache.set(userId, ticket);
+    }
+    if (!ticket) return;
+
+    const sendOne = async () => {
+      try {
+        await sendTypingStatus({
+          account,
+          userId,
+          ticket: ticket!,
+          status: TYPING_STATUS_START,
+        });
+      } catch {
+        // best-effort — typing is a UX nicety, never fatal
+      }
+    };
+
+    // Send one immediately so the user sees "typing..." right away.
+    await sendOne();
+
+    // Refresh every 4s so the indicator keeps showing while the agent works.
+    // iLink typing state has a short server-side TTL; without heartbeats it
+    // disappears in ~5–15s even though the bridge is still busy.
+    const existing = this.typingHeartbeats.get(userId);
+    if (existing) clearInterval(existing);
+    const heartbeat = setInterval(() => {
+      void sendOne();
+    }, 4_000);
+    // Don't keep the event loop alive solely for this timer.
+    if (typeof heartbeat.unref === "function") heartbeat.unref();
+    this.typingHeartbeats.set(userId, heartbeat);
+  }
+
+  async stopTyping(userId: string): Promise<void> {
+    // Stop the heartbeat first so we don't race a refresh after the stop signal.
+    const heartbeat = this.typingHeartbeats.get(userId);
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      this.typingHeartbeats.delete(userId);
+    }
+
+    const account = this.requireAccount();
+    const ticket = this.typingTicketCache.get(userId);
+    if (!ticket) return;
+    try {
+      await sendTypingStatus({
+        account,
+        userId,
+        ticket,
+        status: TYPING_STATUS_STOP,
+      });
+    } catch {
+      // best-effort
     }
   }
 

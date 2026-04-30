@@ -113,6 +113,18 @@ export function formatUserFacingBridgeFatalError(message: string): string {
   return `Bridge error: ${message.replace(/\s+Recent app-server log:.*$/s, "").trim()}`;
 }
 
+// Claude Code's TUI sometimes receives system-injected text that looks like a
+// user input but is actually internal protocol (sub-agent completion notices,
+// slash command echoes, hook reminders, !-bash output, etc). These should not
+// be forwarded to WeChat.
+const SYSTEM_INJECTED_TEXT_RE =
+  /^\s*<(?:task-notification|command-name|command-message|command-args|system-reminder|user-prompt-submit-hook|local-command-(?:stdout|stderr|caveat))[\s>]/i;
+
+function isSystemInjectedText(text: string | undefined): boolean {
+  if (!text) return false;
+  return SYSTEM_INJECTED_TEXT_RE.test(text);
+}
+
 export function shouldForwardBridgeEventToWechat(
   adapter: BridgeAdapterKind,
   eventType: BridgeEvent["type"],
@@ -120,6 +132,15 @@ export function shouldForwardBridgeEventToWechat(
     text?: string;
   } = {},
 ): boolean {
+  // Cross-adapter: never forward system-injected pseudo-inputs (task-notification,
+  // command-name, etc) — these are Claude Code internal protocol, not user-facing.
+  if (
+    eventType === "mirrored_user_input" &&
+    isSystemInjectedText(options.text)
+  ) {
+    return false;
+  }
+
   if (adapter !== "opencode") {
     return true;
   }
@@ -218,7 +239,7 @@ export function canDrainDeferredCodexInboundQueue(params: {
   hasActiveTask: boolean;
 }): boolean {
   return (
-    params.adapter === "codex" &&
+    (params.adapter === "codex" || params.adapter === "claude" || params.adapter === "opencode") &&
     params.deferredCount > 0 &&
     !params.hasPendingConfirmation &&
     !params.hasPendingApproval &&
@@ -363,6 +384,7 @@ async function main(): Promise<void> {
     authorizedUserId: credentials.userId,
   });
   const reapedPeerPids = await reapPeerBridgeProcesses({
+    currentCwd: options.cwd,
     logger: (message) => stateStore.appendLog(message),
   });
   if (reapedPeerPids.length > 0) {
@@ -431,8 +453,27 @@ async function main(): Promise<void> {
   let lastHeartbeatAt = 0;
   let consecutivePollFailures = 0;
 
+  // iLink rate-limits rapid successive sends — when OutputBatcher splits a
+  // long narration into ~15+ sentence chunks, sending them as fast as fetch
+  // resolves makes WeChat reject the tail with `ret=-2` (HTTP 200, undocumented
+  // soft-fail). Self-throttling between chunks keeps an 18-chunk reply within
+  // ~15s and well below the observed limit. (400ms was tested first and still
+  // produced ret=-2 failures — bumped to 800ms based on bridge.log evidence.)
+  const MIN_TEXT_SEND_INTERVAL_MS = 800;
+  let lastTextSendAt = 0;
+
   const queueWechatTextAction = <T>(action: () => Promise<T>) => {
-    const run = textSendChain.then(action);
+    const run = textSendChain.then(async () => {
+      const wait = MIN_TEXT_SEND_INTERVAL_MS - (Date.now() - lastTextSendAt);
+      if (wait > 0) {
+        await new Promise((resolve) => setTimeout(resolve, wait));
+      }
+      try {
+        return await action();
+      } finally {
+        lastTextSendAt = Date.now();
+      }
+    });
     textSendChain = run.then(
       () => undefined,
       () => undefined,
@@ -449,12 +490,54 @@ async function main(): Promise<void> {
     return run;
   };
 
+  // Critical contexts where losing a message strands the user (e.g. an approval
+  // prompt that, if dropped to iLink rate-limit, leaves the TUI frozen until
+  // the 10-min approval timeout). Retry hard with linear backoff before giving
+  // up. Within the queueWechatTextAction chain, the inter-message throttle
+  // still spaces these from neighbours; retries inside the action are the
+  // bonus on top.
+  const CRITICAL_SEND_CONTEXTS = new Set<WechatSendContext>([
+    "approval_required",
+    "fatal_error",
+    "task_failed",
+    "inbound_error",
+  ]);
+  const CRITICAL_RETRY_BACKOFFS_MS = [2_000, 4_000, 8_000, 16_000, 32_000];
+
   const queueWechatMessage = (
     senderId: string,
     text: string,
     context: WechatSendContext = "message",
   ) => {
-    return queueWechatTextAction(() => transport.sendText(senderId, text)).catch((err) => {
+    const isCritical = CRITICAL_SEND_CONTEXTS.has(context);
+    return queueWechatTextAction(async () => {
+      if (!isCritical) {
+        await transport.sendText(senderId, text);
+        return;
+      }
+      let lastError: unknown;
+      for (let attempt = 0; attempt <= CRITICAL_RETRY_BACKOFFS_MS.length; attempt += 1) {
+        try {
+          await transport.sendText(senderId, text);
+          if (attempt > 0) {
+            stateStore.appendLog(
+              `wechat_send_recovered: context=${context} attempt=${attempt + 1}`,
+            );
+          }
+          return;
+        } catch (err) {
+          lastError = err;
+          if (attempt < CRITICAL_RETRY_BACKOFFS_MS.length) {
+            const wait = CRITICAL_RETRY_BACKOFFS_MS[attempt] ?? 32_000;
+            stateStore.appendLog(
+              `wechat_send_retry: context=${context} attempt=${attempt + 1} wait_ms=${wait} error=${truncatePreview(describeWechatTransportError(err), 200)}`,
+            );
+            await new Promise((resolve) => setTimeout(resolve, wait));
+          }
+        }
+      }
+      throw lastError ?? new Error("send failed");
+    }).catch((err) => {
       logError(`Failed to send WeChat ${context}: ${describeWechatTransportError(err)}`);
       stateStore.appendLog(
         formatWechatSendFailureLogEntry({
@@ -504,6 +587,7 @@ async function main(): Promise<void> {
         options,
         stateStore,
         adapter,
+        transport,
       });
       activeTask = nextTask;
       lastHeartbeatAt = 0;
@@ -756,6 +840,7 @@ async function main(): Promise<void> {
             options,
             stateStore,
             adapter,
+            transport,
             queueWechatMessage,
             outputBatcher,
             deferInboundMessage: async (nextMessage) => {
@@ -910,6 +995,7 @@ function wireAdapterEvents(params: {
           await forwardWechatFinalReply({
             adapter: options.adapter,
             rawText: event.text,
+            skipTextSend: event.attachmentsOnly === true,
             sender: {
               sendText: (text) => queueWechatMessage(authorizedUserId, text),
               sendImage: (imagePath) =>
@@ -930,6 +1016,8 @@ function wireAdapterEvents(params: {
                 ),
             },
           });
+          // Reply delivered — stop the "typing..." indicator.
+          void transport.stopTyping(authorizedUserId).catch(() => undefined);
         });
         break;
       case "status":
@@ -1088,6 +1176,7 @@ async function handleInboundMessage(params: {
   options: BridgeCliOptions;
   stateStore: BridgeStateStore;
   adapter: BridgeAdapter;
+  transport: WeChatTransport;
   queueWechatMessage: (
     senderId: string,
     text: string,
@@ -1101,6 +1190,7 @@ async function handleInboundMessage(params: {
     options,
     stateStore,
     adapter,
+    transport,
     queueWechatMessage,
     outputBatcher,
     deferInboundMessage,
@@ -1257,10 +1347,10 @@ async function handleInboundMessage(params: {
       return null;
     }
 
-    await queueWechatMessage(
-      message.senderId,
-      `${options.adapter} is still working. Wait for the current reply or use /stop.`,
-    );
+    // Claude (and other remote-busy adapters): defer instead of rejecting.
+    // This way users can fire follow-up messages (image + caption pattern)
+    // and they'll be processed in order after the current task finishes.
+    await deferInboundMessage(message);
     return null;
   }
 
@@ -1269,6 +1359,7 @@ async function handleInboundMessage(params: {
     options,
     stateStore,
     adapter,
+    transport,
   });
 }
 
@@ -1277,14 +1368,28 @@ async function dispatchInboundWechatText(params: {
   options: BridgeCliOptions;
   stateStore: BridgeStateStore;
   adapter: BridgeAdapter;
+  transport: WeChatTransport;
 }): Promise<ActiveTask> {
-  const { message, options, stateStore, adapter } = params;
+  const { message, options, stateStore, adapter, transport } = params;
+  const mediaPrefix = (message.mediaPaths ?? [])
+    .map((p) => `[Image attached at: ${p}]`)
+    .join("\n");
+  const fullText = mediaPrefix
+    ? (message.text
+        ? `${mediaPrefix}\n${message.text}`
+        : `${mediaPrefix}\n(用户发了图片，没有文字。请用 Read 工具加载图片路径，看完后回复用户。)`)
+    : message.text;
   const activeTask = {
     startedAt: Date.now(),
-    inputPreview: truncatePreview(message.text, 180),
+    inputPreview: truncatePreview(fullText, 180),
   };
-  stateStore.appendLog(`Forwarded input to ${options.adapter}: ${truncatePreview(message.text)}`);
-  await adapter.sendInput(buildWechatInboundPrompt(message.text));
+  stateStore.appendLog(`Forwarded input to ${options.adapter}: ${truncatePreview(fullText)}`);
+
+  // Show "typing..." in WeChat while the agent is working.
+  // Best-effort — don't block sendInput if the typing API hiccups.
+  void transport.startTyping(message.senderId).catch(() => undefined);
+
+  await adapter.sendInput(buildWechatInboundPrompt(fullText));
   return activeTask;
 }
 

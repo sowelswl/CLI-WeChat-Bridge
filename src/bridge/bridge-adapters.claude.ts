@@ -9,6 +9,7 @@ import {
   buildClaudeHookSettings,
   buildClaudePermissionDecisionHookOutput,
   buildClaudePermissionApprovalRequest,
+  shouldAutoApprovePermissionRequest,
   extractClaudeAssistantMessageText,
   extractClaudeResumeConversationId,
   extractClaudeTranscriptFinalReply,
@@ -30,9 +31,11 @@ import {
   normalizeOutput,
   nowIso,
   truncatePreview,
+  WECHAT_ATTACHMENT_BLOCK_STRIP_RE,
 } from "./bridge-utils.ts";
 import { AbstractPtyAdapter } from "./bridge-adapters.core.ts";
 import * as shared from "./bridge-adapters.shared.ts";
+import { ClaudeTranscriptWatcher } from "./transcript-watcher.ts";
 
 type AdapterOptions = shared.AdapterOptions;
 type ClaudePendingHookApproval = shared.ClaudePendingHookApproval;
@@ -74,9 +77,17 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   private workingNoticeSent = false;
   private workingNoticeDelayMs = CLAUDE_WECHAT_WORKING_NOTICE_DELAY_MS;
   private lastCompactCompletionAtMs = 0;
+  private readonly transcriptWatcher: ClaudeTranscriptWatcher;
+  private narrationStreamedThisTurn = false;
 
   constructor(options: AdapterOptions) {
     super(options);
+    this.transcriptWatcher = new ClaudeTranscriptWatcher({
+      onText: (text) => this.handleNarrationText(text),
+      onError: () => {
+        // best-effort — narration streaming is a UX nicety, never fatal.
+      },
+    });
     this.runtimeSessionId = options.initialSharedSessionId ?? options.initialSharedThreadId ?? null;
     this.resumeConversationId = options.initialResumeConversationId ?? null;
     this.transcriptPath = options.initialTranscriptPath ?? null;
@@ -89,7 +100,29 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     }
     if (this.transcriptPath) {
       this.state.transcriptPath = this.transcriptPath;
+      this.transcriptWatcher.start(this.transcriptPath);
     }
+  }
+
+  private handleNarrationText(text: string): void {
+    if (!text) return;
+    // Strip the trailing ```wechat-attachments ... ``` protocol block so the
+    // user doesn't see raw markup in WeChat — the attachments are still
+    // delivered separately by forwardWechatFinalReply.
+    const cleaned = text.replace(WECHAT_ATTACHMENT_BLOCK_STRIP_RE, "").trim();
+    if (!cleaned) {
+      // Whole block was an attachment marker with no surrounding narration
+      // — nothing to stream, but flag the turn so final_reply still skips
+      // sending the (now-empty) text part.
+      this.narrationStreamedThisTurn = true;
+      return;
+    }
+    this.narrationStreamedThisTurn = true;
+    this.emit({
+      type: "stdout",
+      text: cleaned,
+      timestamp: nowIso(),
+    });
   }
 
   override async start(): Promise<void> {
@@ -108,6 +141,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
           `Conversation transcript "${this.transcriptPath}" no longer exists (likely after compact). Starting fresh session.`,
           "warning",
         );
+        this.transcriptWatcher.stop();
         this.transcriptPath = null;
         this.resumeConversationId = null;
         this.runtimeSessionId = null;
@@ -186,6 +220,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   override async reset(): Promise<void> {
     this.clearWechatWorkingNotice(true);
     this.pendingCliApprovalHints = null;
+    this.transcriptWatcher.stop();
     this.runtimeSessionId = null;
     this.resumeConversationId = null;
     this.transcriptPath = null;
@@ -320,6 +355,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.detachLocalTerminal();
     this.clearWechatWorkingNotice(true);
     this.pendingCliApprovalHints = null;
+    this.transcriptWatcher.stop();
     void this.stopHookServer();
     if (this.recoveringInvalidResume && !this.shuttingDown) {
       this.clearCompletionTimer();
@@ -467,7 +503,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
         : quotePosixCommandArg(hookScriptPath);
     fs.writeFileSync(
       settingsFilePath,
-      JSON.stringify(buildClaudeHookSettings(hookCommand), null, 2),
+      JSON.stringify(buildClaudeHookSettings(hookCommand, this.options.cwd), null, 2),
       "utf8",
     );
     this.settingsFilePath = settingsFilePath;
@@ -797,6 +833,11 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.state.resumeConversationId = nextResumeConversationId ?? undefined;
     this.transcriptPath = nextTranscriptPath;
     this.state.transcriptPath = nextTranscriptPath ?? undefined;
+    if (nextTranscriptPath) {
+      this.transcriptWatcher.start(nextTranscriptPath);
+    } else {
+      this.transcriptWatcher.stop();
+    }
 
     if (previousRuntimeSessionId === payload.session_id) {
       return;
@@ -862,6 +903,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.pendingApproval = null;
     this.state.pendingApproval = null;
     this.state.pendingApprovalOrigin = undefined;
+    this.transcriptWatcher.stop();
     this.runtimeSessionId = null;
     this.resumeConversationId = null;
     this.transcriptPath = null;
@@ -896,6 +938,16 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       requestId,
       socket,
     });
+
+    // The WeChat-only user can't see the local TUI, so getting stranded on
+    // a routine `mkdir && cat <<EOF` prompt means a 10-min timeout. For
+    // commands that pass our conservative auto-approve check, confirm
+    // straight away without round-tripping the user.
+    if (shouldAutoApprovePermissionRequest(payload)) {
+      this.respondToClaudeHookApproval(requestId, "confirm");
+      return;
+    }
+
     const request = buildClaudePermissionApprovalRequest(payload);
     this.pendingApproval = {
       ...request,
@@ -972,10 +1024,24 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.state.activeTurnOrigin = undefined;
     this.hasAcceptedInput = false;
     this.setStatus("idle");
+    // Drain pending narration synchronously so anything already flushed to
+    // jsonl is emitted via stdout before we mark the turn done.
+    this.transcriptWatcher.drainNow();
+    this.narrationStreamedThisTurn = false;
+    // ALWAYS skip the final_reply text path for claude:
+    //   - jsonl writes are async — even with drainNow, late writes (the very
+    //     last assistant text block) can land in the watcher AFTER this Stop
+    //     event fires. If we sent text via final_reply too, the late watcher
+    //     fire would deliver the same text again → duplicate messages in WeChat.
+    //   - Putting the text-delivery contract entirely on the watcher means
+    //     "delivered exactly once" (per uuid dedupe). Worst case if the
+    //     watcher fully fails: user gets attachments only — they'll notice
+    //     and re-prompt. That's better than every reply being doubled.
     this.emit({
       type: "final_reply",
       text: this.resolveClaudeFinalReplyText(payload),
       timestamp: nowIso(),
+      attachmentsOnly: true,
     });
     this.emit({
       type: "task_complete",
