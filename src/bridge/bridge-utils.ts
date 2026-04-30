@@ -1224,10 +1224,23 @@ export class OutputBatcher {
     this.buffer += normalized;
     this.recentText = (this.recentText + normalized).slice(-6_000);
 
-    // Real-person feel: flush at sentence boundaries (。！？.!?\n\n)
-    // when normal, or paragraph boundaries (\n\n only) when stressed —
-    // fewer larger messages is the only thing that survives sustained
-    // iLink rate-limiting. The `isStressed` callback flips at runtime.
+    // Stressed: buffer everything until the turn ends (or the idle backstop
+    // fires). One big message is the only thing that reliably survives
+    // sustained iLink rate-limiting — fewer requests = fewer surfaces for
+    // the limiter to bite. Hard ceiling at stressedMaxChars in case the
+    // turn produces an enormous response with no end-of-turn signal.
+    if (this.isStressed()) {
+      while (this.buffer.length >= this.stressedMaxChars) {
+        const nextChunk = this.buffer.slice(0, this.stressedMaxChars);
+        this.buffer = this.buffer.slice(this.stressedMaxChars);
+        this.enqueueFlush(nextChunk);
+      }
+      this.ensureFlushTimer();
+      return;
+    }
+
+    // Normal: flush at sentence boundaries for the "real-person typing"
+    // feel.
     const MIN_SENTENCE_FLUSH = 4;
     while (true) {
       const breakIdx = this.findSentenceBreak(this.buffer, MIN_SENTENCE_FLUSH);
@@ -1239,11 +1252,9 @@ export class OutputBatcher {
 
     // Hard ceiling fallback: if some block ran on without punctuation,
     // still split by maxChars so a single chunk doesn't grow unbounded.
-    // Stressed mode raises the ceiling so paragraph chunks aren't sliced.
-    const ceiling = this.isStressed() ? this.stressedMaxChars : this.normalMaxChars;
-    while (this.buffer.length >= ceiling) {
-      const nextChunk = this.buffer.slice(0, ceiling);
-      this.buffer = this.buffer.slice(ceiling);
+    while (this.buffer.length >= this.normalMaxChars) {
+      const nextChunk = this.buffer.slice(0, this.normalMaxChars);
+      this.buffer = this.buffer.slice(this.normalMaxChars);
       this.enqueueFlush(nextChunk);
     }
 
@@ -1308,10 +1319,17 @@ export class OutputBatcher {
       return;
     }
 
+    // Stressed mode buffers until end-of-turn (final_reply triggers
+    // flushNow). The idle timer is just a backstop so a hung turn doesn't
+    // strand the buffer indefinitely — long enough to give the turn time
+    // to finish naturally, short enough that the user isn't waiting forever
+    // if the agent is stuck.
+    const interval = this.isStressed() ? 30_000 : this.flushIntervalMs;
+
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
       void this.flushNow();
-    }, this.flushIntervalMs);
+    }, interval);
   }
 
   private enqueueFlush(text: string): void {

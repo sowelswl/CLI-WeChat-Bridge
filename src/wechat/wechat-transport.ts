@@ -429,6 +429,12 @@ function buildHeaders(token?: string, body?: string): Record<string, string> {
     "Content-Type": "application/json",
     AuthorizationType: "ilink_bot_token",
     "X-WECHAT-UIN": randomWechatUin(),
+    // iLink Bot expects these two as part of its standard handshake. Without
+    // them clients are flagged as non-standard, surfacing as `errcode: -14`
+    // (session timeout) on getUpdates and contributing to ret=-2 throttling
+    // on sendmessage. See QwenLM/qwen-code#2908.
+    "iLink-App-Id": "bot",
+    "iLink-App-ClientVersion": "65536",
   };
 
   if (body) {
