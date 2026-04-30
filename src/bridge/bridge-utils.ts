@@ -1193,7 +1193,9 @@ export function formatPendingApprovalReminder(
 export class OutputBatcher {
   private readonly onFlush: (text: string) => Promise<void> | void;
   private readonly flushIntervalMs: number;
-  private readonly maxChars: number;
+  private readonly normalMaxChars: number;
+  private readonly stressedMaxChars: number;
+  private readonly isStressed: () => boolean;
   private buffer = "";
   private recentText = "";
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1203,10 +1205,14 @@ export class OutputBatcher {
     onFlush: (text: string) => Promise<void> | void,
     flushIntervalMs = 800,
     maxChars = 200,
+    isStressed: () => boolean = () => false,
+    stressedMaxChars = 1_500,
   ) {
     this.onFlush = onFlush;
     this.flushIntervalMs = flushIntervalMs;
-    this.maxChars = maxChars;
+    this.normalMaxChars = maxChars;
+    this.stressedMaxChars = stressedMaxChars;
+    this.isStressed = isStressed;
   }
 
   push(text: string): void {
@@ -1219,8 +1225,9 @@ export class OutputBatcher {
     this.recentText = (this.recentText + normalized).slice(-6_000);
 
     // Real-person feel: flush at sentence boundaries (。！？.!?\n\n)
-    // as soon as we have a meaningful chunk. Avoids "one big paragraph"
-    // delivery and emulates typing-then-sending in pieces.
+    // when normal, or paragraph boundaries (\n\n only) when stressed —
+    // fewer larger messages is the only thing that survives sustained
+    // iLink rate-limiting. The `isStressed` callback flips at runtime.
     const MIN_SENTENCE_FLUSH = 4;
     while (true) {
       const breakIdx = this.findSentenceBreak(this.buffer, MIN_SENTENCE_FLUSH);
@@ -1232,9 +1239,11 @@ export class OutputBatcher {
 
     // Hard ceiling fallback: if some block ran on without punctuation,
     // still split by maxChars so a single chunk doesn't grow unbounded.
-    while (this.buffer.length >= this.maxChars) {
-      const nextChunk = this.buffer.slice(0, this.maxChars);
-      this.buffer = this.buffer.slice(this.maxChars);
+    // Stressed mode raises the ceiling so paragraph chunks aren't sliced.
+    const ceiling = this.isStressed() ? this.stressedMaxChars : this.normalMaxChars;
+    while (this.buffer.length >= ceiling) {
+      const nextChunk = this.buffer.slice(0, ceiling);
+      this.buffer = this.buffer.slice(ceiling);
       this.enqueueFlush(nextChunk);
     }
 
@@ -1245,7 +1254,15 @@ export class OutputBatcher {
     // Need at least minLength chars before we'll consider flushing,
     // so very short fragments ("好。") wait for more context.
     if (text.length < minLength) return -1;
-    // Chinese punctuation: 。！？； — always a sentence end.
+
+    if (this.isStressed()) {
+      // Stressed mode: paragraph-only break. Trying to send sentence-sized
+      // chunks under sustained throttling just feeds more failures.
+      const idx = text.indexOf("\n\n");
+      return idx === -1 ? -1 : idx + 1;
+    }
+
+    // Normal mode — Chinese punctuation: 。！？； — always a sentence end.
     // English . ! ? — only count when NOT inside URLs/numbers/abbreviations:
     //   - "." must follow a non-digit AND be followed by whitespace/EOL
     //     (so github.com is preserved, "1. " is preserved, "hi. " breaks).

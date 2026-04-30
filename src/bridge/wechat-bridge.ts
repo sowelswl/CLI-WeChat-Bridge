@@ -454,18 +454,48 @@ async function main(): Promise<void> {
   let lastHeartbeatAt = 0;
   let consecutivePollFailures = 0;
 
-  // iLink rate-limits rapid successive sends — when OutputBatcher splits a
-  // long narration into ~15+ sentence chunks, sending them as fast as fetch
-  // resolves makes WeChat reject the tail with `ret=-2` (HTTP 200, undocumented
-  // soft-fail). Self-throttling between chunks keeps an 18-chunk reply within
-  // ~15s and well below the observed limit. (400ms was tested first and still
-  // produced ret=-2 failures — bumped to 800ms based on bridge.log evidence.)
-  const MIN_TEXT_SEND_INTERVAL_MS = 800;
+  // Adaptive iLink rate-limit handling.
+  //
+  // iLink soft-rejects bursts with HTTP 200 + ret=-2 once the bridge sends
+  // too many messages too quickly. The user's preference is "small chunks
+  // by default, big chunks during throttling — but never silent loss".
+  //
+  // Two-mode design:
+  //   normal:  400ms between sends, sentence-level chunks  (fast feel)
+  //   stressed: 2000ms between sends, paragraph-level chunks, every send
+  //             gets the same 5x exponential-backoff retry as critical
+  //             contexts — so messages eventually land even under sustained
+  //             throttling.
+  //
+  // Trigger: any ret=-2 → mark stressed for 60s. Each new failure refreshes
+  // the timer. After 60s of clean sends, mode auto-reverts.
+  const NORMAL_TEXT_SEND_INTERVAL_MS = 400;
+  const STRESSED_TEXT_SEND_INTERVAL_MS = 2_000;
+  const STRESS_DURATION_MS = 60_000;
   let lastTextSendAt = 0;
+  let stressedUntilMs = 0;
+  const isStressed = (): boolean => Date.now() < stressedUntilMs;
+  const markStressed = (): void => {
+    const now = Date.now();
+    const wasStressed = stressedUntilMs > now;
+    stressedUntilMs = now + STRESS_DURATION_MS;
+    if (!wasStressed) {
+      stateStore.appendLog(
+        `wechat_throttle_stressed: switched to paragraph mode + 2s gap + retry-on-fail for ${STRESS_DURATION_MS / 1000}s`,
+      );
+    }
+  };
+  const isLikelyRateLimitError = (err: unknown): boolean => {
+    const text = err instanceof Error ? err.message : String(err);
+    return /ret=-2\b/.test(text);
+  };
 
   const queueWechatTextAction = <T>(action: () => Promise<T>) => {
     const run = textSendChain.then(async () => {
-      const wait = MIN_TEXT_SEND_INTERVAL_MS - (Date.now() - lastTextSendAt);
+      const interval = isStressed()
+        ? STRESSED_TEXT_SEND_INTERVAL_MS
+        : NORMAL_TEXT_SEND_INTERVAL_MS;
+      const wait = interval - (Date.now() - lastTextSendAt);
       if (wait > 0) {
         await new Promise((resolve) => setTimeout(resolve, wait));
       }
@@ -510,10 +540,17 @@ async function main(): Promise<void> {
     text: string,
     context: WechatSendContext = "message",
   ) => {
-    const isCritical = CRITICAL_SEND_CONTEXTS.has(context);
     return queueWechatTextAction(async () => {
-      if (!isCritical) {
-        await transport.sendText(senderId, text);
+      // In stressed mode every context gets the retry treatment — losing
+      // a regular text chunk is what produces "user got nothing" outages.
+      const useRetry = CRITICAL_SEND_CONTEXTS.has(context) || isStressed();
+      if (!useRetry) {
+        try {
+          await transport.sendText(senderId, text);
+        } catch (err) {
+          if (isLikelyRateLimitError(err)) markStressed();
+          throw err;
+        }
         return;
       }
       let lastError: unknown;
@@ -528,6 +565,7 @@ async function main(): Promise<void> {
           return;
         } catch (err) {
           lastError = err;
+          if (isLikelyRateLimitError(err)) markStressed();
           if (attempt < CRITICAL_RETRY_BACKOFFS_MS.length) {
             const wait = CRITICAL_RETRY_BACKOFFS_MS[attempt] ?? 32_000;
             stateStore.appendLog(
@@ -550,9 +588,14 @@ async function main(): Promise<void> {
     });
   };
 
-  const outputBatcher = new OutputBatcher(async (text) => {
-    await queueWechatMessage(stateStore.getState().authorizedUserId, text);
-  });
+  const outputBatcher = new OutputBatcher(
+    async (text) => {
+      await queueWechatMessage(stateStore.getState().authorizedUserId, text);
+    },
+    /* flushIntervalMs */ undefined,
+    /* maxChars */ undefined,
+    /* isStressed */ isStressed,
+  );
   const maybeDrainDeferredInboundMessages = async (): Promise<void> => {
     if (drainingDeferredInboundMessages || !ensureRuntimeOwnership()) {
       return;
