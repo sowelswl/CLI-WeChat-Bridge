@@ -28,8 +28,10 @@ set -u
 
 TMUX_BIN="${TMUX_BIN:-$(command -v tmux || true)}"
 START_BIN="${START_BIN:-$(command -v wechat-claude-start || true)}"
+CAFFEINATE_BIN="${CAFFEINATE_BIN:-$(command -v caffeinate || true)}"
 CHANNEL_DATA_BASE="${WECHAT_CHANNEL_DATA_BASE:-$HOME/.claude/channels}"
 DEFAULT_WORKSPACE_BASE="${WECHAT_DEFAULT_WORKSPACE_BASE:-$HOME/wechat-channels}"
+CAFFEINATE_PID_FILE="${CHANNEL_DATA_BASE}/.wechat-bridges-caffeinate.pid"
 
 if [[ -z "$TMUX_BIN" ]]; then
   echo "error: tmux not found on PATH (install with 'brew install tmux' on macOS)" >&2
@@ -39,6 +41,27 @@ if [[ -z "$START_BIN" ]]; then
   echo "error: wechat-claude-start not found on PATH (run 'npm install -g .' from the repo root)" >&2
   exit 1
 fi
+
+ensure_caffeinate() {
+  # macOS only — keep the system awake while bridges are up. pmset sleep=0
+  # already covers AC power, but caffeinate -i also handles battery and
+  # survives third-party tools that override pmset. No-op on Linux.
+  if [[ -z "$CAFFEINATE_BIN" ]]; then
+    return
+  fi
+  mkdir -p "$(dirname "$CAFFEINATE_PID_FILE")"
+  if [[ -f "$CAFFEINATE_PID_FILE" ]]; then
+    local existing
+    existing=$(cat "$CAFFEINATE_PID_FILE" 2>/dev/null)
+    if [[ -n "$existing" ]] && kill -0 "$existing" 2>/dev/null; then
+      return
+    fi
+    rm -f "$CAFFEINATE_PID_FILE"
+  fi
+  "$CAFFEINATE_BIN" -i &
+  echo "$!" > "$CAFFEINATE_PID_FILE"
+  echo "caffeinate -i started (pid $(cat "$CAFFEINATE_PID_FILE"))"
+}
 
 resolve_workspace() {
   local letter="$1"
@@ -95,6 +118,8 @@ fi
 if [[ $# -eq 0 ]]; then
   set -- A B
 fi
+
+ensure_caffeinate
 
 for letter in "$@"; do
   start_one "$letter"

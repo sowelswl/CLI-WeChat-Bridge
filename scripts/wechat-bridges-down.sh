@@ -19,11 +19,29 @@ set -u
 TMUX_BIN="${TMUX_BIN:-$(command -v tmux || true)}"
 CHANNEL_DATA_BASE="${WECHAT_CHANNEL_DATA_BASE:-$HOME/.claude/channels}"
 DEFAULT_WORKSPACE_BASE="${WECHAT_DEFAULT_WORKSPACE_BASE:-$HOME/wechat-channels}"
+CAFFEINATE_PID_FILE="${CHANNEL_DATA_BASE}/.wechat-bridges-caffeinate.pid"
 
 if [[ -z "$TMUX_BIN" ]]; then
   echo "error: tmux not found on PATH" >&2
   exit 1
 fi
+
+maybe_stop_caffeinate() {
+  # Only release the system-awake assertion once no wechat-* tmux session
+  # remains; otherwise leave caffeinate running for the surviving channels.
+  if "$TMUX_BIN" list-sessions 2>/dev/null | grep -q '^wechat-'; then
+    return
+  fi
+  if [[ -f "$CAFFEINATE_PID_FILE" ]]; then
+    local pid
+    pid=$(cat "$CAFFEINATE_PID_FILE" 2>/dev/null)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      echo "stopped caffeinate (pid $pid)"
+    fi
+    rm -f "$CAFFEINATE_PID_FILE"
+  fi
+}
 
 resolve_workspace() {
   local letter="$1"
@@ -72,3 +90,5 @@ fi
 for letter in "$@"; do
   stop_one "$letter"
 done
+
+maybe_stop_caffeinate
