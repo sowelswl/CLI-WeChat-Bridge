@@ -1199,7 +1199,8 @@ export class OutputBatcher {
   private buffer = "";
   private recentText = "";
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
-  private flushChain = Promise.resolve();
+  private drainTask: Promise<void> | null = null;
+  private forceFlush = false;
 
   constructor(
     onFlush: (text: string) => Promise<void> | void,
@@ -1215,6 +1216,13 @@ export class OutputBatcher {
     this.isStressed = isStressed;
   }
 
+  /**
+   * Append text to the buffer and kick the drain loop. The drain decides
+   * chunk boundaries each iteration based on the CURRENT stress flag, so
+   * if iLink throttling activates mid-stream the remaining buffer is
+   * automatically merged into a single big chunk instead of continuing to
+   * fire sentence-sized retries.
+   */
   push(text: string): void {
     const normalized = normalizeOutput(text);
     if (!normalized) {
@@ -1223,87 +1231,30 @@ export class OutputBatcher {
 
     this.buffer += normalized;
     this.recentText = (this.recentText + normalized).slice(-6_000);
-
-    // Stressed: buffer everything until the turn ends (or the idle backstop
-    // fires). One big message is the only thing that reliably survives
-    // sustained iLink rate-limiting — fewer requests = fewer surfaces for
-    // the limiter to bite. Hard ceiling at stressedMaxChars in case the
-    // turn produces an enormous response with no end-of-turn signal.
-    if (this.isStressed()) {
-      while (this.buffer.length >= this.stressedMaxChars) {
-        const nextChunk = this.buffer.slice(0, this.stressedMaxChars);
-        this.buffer = this.buffer.slice(this.stressedMaxChars);
-        this.enqueueFlush(nextChunk);
-      }
-      this.ensureFlushTimer();
-      return;
-    }
-
-    // Normal: flush at sentence boundaries for the "real-person typing"
-    // feel.
-    const MIN_SENTENCE_FLUSH = 4;
-    while (true) {
-      const breakIdx = this.findSentenceBreak(this.buffer, MIN_SENTENCE_FLUSH);
-      if (breakIdx === -1) break;
-      const nextChunk = this.buffer.slice(0, breakIdx + 1);
-      this.buffer = this.buffer.slice(breakIdx + 1);
-      this.enqueueFlush(nextChunk);
-    }
-
-    // Hard ceiling fallback: if some block ran on without punctuation,
-    // still split by maxChars so a single chunk doesn't grow unbounded.
-    while (this.buffer.length >= this.normalMaxChars) {
-      const nextChunk = this.buffer.slice(0, this.normalMaxChars);
-      this.buffer = this.buffer.slice(this.normalMaxChars);
-      this.enqueueFlush(nextChunk);
-    }
-
+    this.kickDrain();
     this.ensureFlushTimer();
   }
 
-  private findSentenceBreak(text: string, minLength: number): number {
-    // Need at least minLength chars before we'll consider flushing,
-    // so very short fragments ("好。") wait for more context.
-    if (text.length < minLength) return -1;
-
-    if (this.isStressed()) {
-      // Stressed mode: paragraph-only break. Trying to send sentence-sized
-      // chunks under sustained throttling just feeds more failures.
-      const idx = text.indexOf("\n\n");
-      return idx === -1 ? -1 : idx + 1;
-    }
-
-    // Normal mode — Chinese punctuation: 。！？； — always a sentence end.
-    // English . ! ? — only count when NOT inside URLs/numbers/abbreviations:
-    //   - "." must follow a non-digit AND be followed by whitespace/EOL
-    //     (so github.com is preserved, "1. " is preserved, "hi. " breaks).
-    //   - "!" / "?" must follow a non-digit and be followed by whitespace/EOL.
-    // Double newline is also a hard break.
-    const re = /[。！？；]|(?<!\d)[.!?](?=\s|$)|\n\n/g;
-    const m = re.exec(text);
-    return m ? m.index + m[0].length - 1 : -1;
-  }
-
+  /**
+   * Force everything currently buffered out as a single chunk, bypassing
+   * sentence-break logic. Called from the bridge's final_reply path.
+   */
   async flushNow(): Promise<void> {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
-
-    if (!this.buffer) {
-      await this.flushChain;
-      return;
+    this.forceFlush = true;
+    this.kickDrain();
+    if (this.drainTask) {
+      await this.drainTask;
     }
-
-    const chunk = this.buffer;
-    this.buffer = "";
-    this.enqueueFlush(chunk);
-    await this.flushChain;
   }
 
   clear(): void {
     this.buffer = "";
     this.recentText = "";
+    this.forceFlush = false;
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
@@ -1314,33 +1265,98 @@ export class OutputBatcher {
     return summarizeOutput(this.recentText, maxLength);
   }
 
+  private kickDrain(): void {
+    if (this.drainTask) {
+      // A drain is already running; it'll see the new buffer / forceFlush
+      // on its next loop iteration. No need to spawn another.
+      return;
+    }
+    this.drainTask = this.runDrain().finally(() => {
+      this.drainTask = null;
+      // Race: a push() that arrived just after the loop's last buffer
+      // check would see drainTask still set and skip kickDrain. Re-check
+      // here and kick again if needed.
+      if (this.buffer) {
+        setTimeout(() => this.kickDrain(), 0);
+      }
+    });
+  }
+
+  private async runDrain(): Promise<void> {
+    const MIN_SENTENCE_FLUSH = 4;
+    while (this.buffer) {
+      const stressed = this.isStressed();
+      const drainAll = this.forceFlush || stressed;
+
+      let chunk: string | null = null;
+      if (drainAll) {
+        // Take as much as the stressed ceiling allows — typically the
+        // entire buffer, but capped so we never send a single multi-MB
+        // message to iLink even if the turn is huge.
+        const take = Math.min(this.buffer.length, this.stressedMaxChars);
+        chunk = this.buffer.slice(0, take);
+        this.buffer = this.buffer.slice(take);
+      } else {
+        const breakIdx = this.findSentenceBreak(this.buffer, MIN_SENTENCE_FLUSH);
+        if (breakIdx >= 0) {
+          chunk = this.buffer.slice(0, breakIdx + 1);
+          this.buffer = this.buffer.slice(breakIdx + 1);
+        } else if (this.buffer.length >= this.normalMaxChars) {
+          chunk = this.buffer.slice(0, this.normalMaxChars);
+          this.buffer = this.buffer.slice(this.normalMaxChars);
+        } else {
+          // Nothing safe to send yet; wait for more push() or flushNow().
+          return;
+        }
+      }
+
+      const payload = chunk ? chunk.trim() : "";
+      if (!payload) continue;
+
+      try {
+        await Promise.resolve(this.onFlush(payload));
+      } catch {
+        // onFlush is expected to handle its own errors (the bridge's
+        // queueWechatMessage already logs/swallows transport failures).
+      }
+      // Loop top re-evaluates isStressed() — if the send we just awaited
+      // tripped the stress flag, the next chunk drains as a single block.
+    }
+    // Buffer fully drained — reset the force flag so the next turn starts
+    // in normal mode again.
+    this.forceFlush = false;
+  }
+
+  private findSentenceBreak(text: string, minLength: number): number {
+    // Need at least minLength chars before we'll consider flushing,
+    // so very short fragments ("好。") wait for more context.
+    if (text.length < minLength) return -1;
+
+    // Chinese punctuation: 。！？； — always a sentence end.
+    // English . ! ? — only count when NOT inside URLs/numbers/abbreviations:
+    //   - "." must follow a non-digit AND be followed by whitespace/EOL
+    //     (so github.com is preserved, "1. " is preserved, "hi. " breaks).
+    //   - "!" / "?" must follow a non-digit and be followed by whitespace/EOL.
+    // Double newline is also a hard break.
+    const re = /[。！？；]|(?<!\d)[.!?](?=\s|$)|\n\n/g;
+    const m = re.exec(text);
+    return m ? m.index + m[0].length - 1 : -1;
+  }
+
   private ensureFlushTimer(): void {
     if (this.flushTimer || !this.buffer) {
       return;
     }
 
-    // Stressed mode buffers until end-of-turn (final_reply triggers
-    // flushNow). The idle timer is just a backstop so a hung turn doesn't
-    // strand the buffer indefinitely — long enough to give the turn time
-    // to finish naturally, short enough that the user isn't waiting forever
-    // if the agent is stuck.
+    // Idle backstop: if no further push() arrives, flush whatever's left.
+    // Stressed mode is patient — gives the turn time to finish — but not
+    // forever. Normal mode keeps the chatty real-person feel.
     const interval = this.isStressed() ? 30_000 : this.flushIntervalMs;
 
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
       void this.flushNow();
     }, interval);
-  }
-
-  private enqueueFlush(text: string): void {
-    const payload = text.trim();
-    if (!payload) {
-      return;
-    }
-
-    this.flushChain = this.flushChain
-      .then(() => Promise.resolve(this.onFlush(payload)))
-      .catch(() => undefined);
   }
 }
 
