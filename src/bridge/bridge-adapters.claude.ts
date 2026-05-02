@@ -188,6 +188,73 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.writeToPty(text.replace(/\r?\n/g, "\r"));
     this.writeToPty("\r");
     this.armWechatWorkingNotice();
+    this.scheduleStuckInputRecovery(normalizedText);
+  }
+
+  /**
+   * Workaround for a flaky claude TUI input handler — when a sub-agent has
+   * been running and the main turn just transitioned from busy to idle, the
+   * bytes we wrote get buffered but never committed as a new turn. jsonl
+   * never gets the user message, the bridge thinks claude is busy forever.
+   *
+   * Empirically a manual Enter press recovers it. After a short delay we
+   * peek at the transcript jsonl: if our input committed, do nothing; if
+   * not, send another \r to nudge the parser. The risk of submitting an
+   * empty turn (if the first \r already took) is small because the input
+   * box was already emptied — claude TUI ignores a bare \r on empty input.
+   */
+  private scheduleStuckInputRecovery(needle: string): void {
+    setTimeout(() => {
+      if (!this.pty) return;
+      try {
+        if (this.transcriptHasRecentUserText(needle)) return;
+        this.writeToPty("\r");
+        process.stderr.write(
+          `[claude-adapter] poked stuck PTY input (jsonl had no recent user record matching).\n`,
+        );
+      } catch {
+        /* best-effort */
+      }
+    }, 2_000);
+  }
+
+  private transcriptHasRecentUserText(needle: string): boolean {
+    if (!this.transcriptPath || !needle) return false;
+    const sample = needle.slice(0, 40);
+    if (!sample) return false;
+    try {
+      const raw = fs.readFileSync(this.transcriptPath, "utf8");
+      const lines = raw.split("\n").filter(Boolean);
+      // Walk backwards looking for the most recent role:user record with a
+      // string body — that's where our injected input lands when it commits.
+      for (let i = lines.length - 1; i >= Math.max(0, lines.length - 12); i -= 1) {
+        try {
+          const o = JSON.parse(lines[i]);
+          const msg = o?.message;
+          if (!msg || msg.role !== "user") continue;
+          const c = msg.content;
+          if (typeof c === "string") {
+            return c.includes(sample);
+          }
+          if (Array.isArray(c)) {
+            for (const b of c) {
+              if (b && typeof b === "object" && b.type === "text" && typeof b.text === "string") {
+                if (b.text.includes(sample)) return true;
+              }
+            }
+            // Tool-result records come back as arrays — keep walking past
+            // them until we hit a real user input record.
+            continue;
+          }
+          return false;
+        } catch {
+          continue;
+        }
+      }
+      return false;
+    } catch {
+      return false;
+    }
   }
 
   override async listResumeSessions(_limit = 10): Promise<BridgeResumeSessionCandidate[]> {

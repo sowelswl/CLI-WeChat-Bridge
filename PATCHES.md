@@ -63,15 +63,21 @@ Claude is still working on:
 
 `shouldForwardBridgeEventToWechat` 检测 `^<task-notification|command-name|system-reminder|user-prompt-submit-hook|local-command-stdout|stderr|caveat>` 形式的字符串，跳过 forward。子 agent 完成的 task-notification、`!` 命令的 stdout、slash 命令镜像等内部协议字符串不再泄露到用户微信。
 
-### 5. claude TUI input handler 在 background agent 期间偶发卡顿
+### 5. ~~claude TUI input handler 在 background agent 期间偶发卡顿~~ **已加自动恢复**
 
 **现象**：sub-agent 后台跑、主对话从 busy 切到 idle 的瞬间，bridge 经 PTY 写入的 inbound 字符流被 claude TUI buffer 但不 commit 成新 turn。jsonl 没新 user message，CPU 低，但表面 typing 心跳照转。在终端键盘按一下 Enter 后能恢复。
 
 **疑似根因**：claude TUI 的 input event loop 在某些状态过渡时没及时读取 PTY。
 
-**待办的 workaround**：sendInput 后延迟 N ms 额外 poke 一次 PTY（fake SIGWINCH / 多发一个 `\r`）强制刷新。风险：可能误 submit 空 turn 或与 claude TUI 内部状态冲突，需谨慎。
+**workaround 实现**：`sendInput` 末尾调度 2s 后的 `scheduleStuckInputRecovery`：
+- 读 jsonl 末尾几行
+- 找最近一条 role=user 且 content 是 string 的记录
+- 如果它包含本次输入的前 40 字（needle），认为已 commit，不动
+- 否则 `writeToPty("\r")` 模拟 Enter 把卡住的输入冲出去
 
-**优先级**：低，遇到时键盘按 Enter 即可恢复。
+风险：如果 needle 检测漏判（比如 jsonl 还没刷盘但其实已经 commit），可能给空输入框补一个 `\r`，claude TUI 一般会忽略空输入。实测无观察到副作用。
+
+**位置**：`src/bridge/bridge-adapters.claude.ts` 的 `scheduleStuckInputRecovery` / `transcriptHasRecentUserText`。
 
 ### 6. 流式 narration 在 pre-tool 阶段不 forward
 
